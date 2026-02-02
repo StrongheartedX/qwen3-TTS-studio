@@ -79,22 +79,17 @@ def combine_audio_clips(
                 # Clean up already loaded clips on error
                 for loaded_clip in audio_clips:
                     loaded_clip.close()
-                raise IOError(
-                    f"Failed to load audio file {clip_path.name}: {e}"
-                ) from e
+                raise IOError(f"Failed to load audio file {clip_path.name}: {e}") from e
 
         # Concatenate all clips
         logger.info("Concatenating audio clips...")
         final_audio = concatenate_audioclips(audio_clips)
 
-        # Export to MP3
         logger.info(f"Exporting to MP3 with bitrate {bitrate}...")
         final_audio.write_audiofile(
             str(output_path),
             codec="libmp3lame",
             bitrate=bitrate,
-            verbose=False,
-            logger=None,
         )
 
         logger.info(f"✓ Successfully created podcast: {output_path}")
