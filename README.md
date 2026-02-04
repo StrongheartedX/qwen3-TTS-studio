@@ -16,7 +16,10 @@ Qwen3-TTS is a powerful text-to-speech model, but using it directly requires dea
 ## Features
 
 ### Voice Generation
-- **Voice Clone**: Clone any voice with just a 3-second audio sample
+- **Voice Clone**: Clone any voice with multiple audio samples for higher quality
+  - Multi-sample support with automatic quality analysis (duration, SNR)
+  - Weighted embedding combination for more consistent results
+  - Auto-transcription via OpenAI Whisper API
 - **Custom Voice**: 9 preset voices with style control (Vivian, Serena, Ryan, etc.)
 - **Voice Design**: Describe your desired voice in natural language
 - **10 Language Support**: Korean, English, Chinese, Japanese, German, French, Russian, Portuguese, Spanish, Italian
@@ -164,6 +167,7 @@ qwen3-TTS-studio/
 │   ├── generator.py            # TTS generation
 │   ├── batch.py                # Batch processing
 │   ├── combiner.py             # Audio concatenation
+│   ├── embedding_utils.py      # Multi-sample voice embedding
 │   └── model_loader.py         # Model loading
 │
 └── storage/                    # Data Persistence
