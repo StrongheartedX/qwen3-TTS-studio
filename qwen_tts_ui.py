@@ -213,7 +213,135 @@ PERSONA_CSS = """
 }
 """
 
+MULTISAMPLE_CSS = """
+.sample-list-container {
+    background: #0d0d14;
+    border: 1px solid #2a2a40;
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+.sample-item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem;
+    background: #14141f;
+    border: 1px solid #2a2a40;
+    border-radius: 8px;
+    margin-bottom: 0.5rem;
+    transition: all 0.2s ease;
+}
+.sample-item:hover {
+    background: #1a1a2e;
+    border-color: #3a3a55;
+}
+.sample-item.primary {
+    border-color: #5050ff;
+    background: rgba(80, 80, 255, 0.08);
+}
+.sample-info {
+    flex: 1;
+    min-width: 0;
+}
+.sample-name {
+    font-weight: 500;
+    color: #f0f0f5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.sample-meta {
+    font-size: 0.8rem;
+    color: #8888a0;
+    display: flex;
+    gap: 0.75rem;
+    margin-top: 0.25rem;
+}
+.sample-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    text-transform: uppercase;
+}
+.sample-badge.primary {
+    background: rgba(80, 80, 255, 0.2);
+    color: #8080ff;
+}
+.sample-badge.good {
+    background: rgba(80, 200, 120, 0.2);
+    color: #50c878;
+}
+.sample-badge.warning {
+    background: rgba(255, 180, 50, 0.2);
+    color: #ffb432;
+}
+.sample-total {
+    padding: 0.75rem;
+    background: #1a1a2e;
+    border-radius: 8px;
+    margin-top: 0.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.sample-total-label {
+    color: #8888a0;
+    font-size: 0.9rem;
+}
+.sample-total-value {
+    color: #f0f0f5;
+    font-weight: 600;
+}
+.sample-warnings {
+    margin-top: 0.75rem;
+    padding: 0.75rem;
+    background: rgba(255, 180, 50, 0.1);
+    border: 1px solid rgba(255, 180, 50, 0.3);
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: #ffb432;
+}
+.sample-recommendations {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(80, 80, 255, 0.1);
+    border-radius: 6px;
+    font-size: 0.8rem;
+    color: #8080ff;
+}
+.combine-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem;
+    background: #14141f;
+    border: 1px solid #2a2a40;
+    border-radius: 8px;
+    margin-top: 0.75rem;
+}
+.combine-toggle-label {
+    font-size: 0.9rem;
+    color: #f0f0f5;
+}
+.combine-toggle-desc {
+    font-size: 0.8rem;
+    color: #8888a0;
+}
+"""
+
 from audio.model_loader import MODEL_PATHS, get_model, loaded_models, _mps_cleanup
+from audio.embedding_utils import (
+    AudioSampleInfo,
+    analyze_audio_samples,
+    combine_speaker_embeddings,
+    create_combined_voice_clone_prompt,
+    format_samples_summary,
+    get_sample_warnings,
+    get_audio_duration as get_audio_duration_util,
+    estimate_snr,
+)
 
 DEFAULT_PARAMS = {
     "temperature": 0.9,
@@ -391,7 +519,7 @@ def get_audio_duration(audio_path):
     try:
         data, sr = sf.read(audio_path)
         return len(data) / sr
-    except:
+    except Exception:
         return 0
 
 
@@ -1246,6 +1374,299 @@ def clone_voice(
         del wavs
         del voice_clone_prompt
         _mps_cleanup()
+
+
+def clone_voice_multi(
+    audio_files: list,
+    transcripts_json: str,
+    model_name: str,
+    test_text: str,
+    language: str,
+    combine_samples: bool,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+    max_new_tokens: int,
+    sub_temp: float,
+    sub_top_k: int,
+    sub_top_p: float,
+    progress=gr.Progress(),
+):
+    if not audio_files:
+        raise gr.Error("Please upload at least one reference audio sample")
+
+    try:
+        transcripts = json.loads(transcripts_json) if transcripts_json else {}
+    except json.JSONDecodeError:
+        transcripts = {}
+
+    audio_paths = []
+    audio_transcripts = []
+    for af in audio_files:
+        if af is None:
+            continue
+        path = af if isinstance(af, str) else af.name
+        audio_paths.append(path)
+        fname = Path(path).name
+        audio_transcripts.append(transcripts.get(fname, ""))
+
+    if not audio_paths:
+        raise gr.Error("No valid audio files provided")
+
+    has_transcripts = any(t.strip() for t in audio_transcripts)
+    if not has_transcripts:
+        raise gr.Error("Please provide transcript for at least the primary sample")
+
+    save_settings(
+        {
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "max_new_tokens": max_new_tokens,
+            "subtalker_temperature": sub_temp,
+            "subtalker_top_k": sub_top_k,
+            "subtalker_top_p": sub_top_p,
+        }
+    )
+
+    start_time = time.time()
+    wavs = None
+    voice_clone_prompt = None
+
+    try:
+        progress(0.1, desc="Loading model...")
+        model = get_model(model_name)
+        load_time = time.time() - start_time
+
+        progress(
+            0.2,
+            desc=f"Model loaded ({load_time:.1f}s). Analyzing {len(audio_paths)} sample(s)...",
+        )
+
+        sample_infos = analyze_audio_samples(audio_paths, audio_transcripts)
+
+        if combine_samples and len(sample_infos) > 1:
+            progress(0.3, desc="Combining voice embeddings...")
+            voice_clone_prompt = create_combined_voice_clone_prompt(
+                model=model,
+                sample_infos=sample_infos,
+                x_vector_only_mode=False,
+            )
+            primary_info = next(
+                (s for s in sample_infos if s.is_primary), sample_infos[0]
+            )
+        else:
+            primary_info = sample_infos[0]
+            voice_clone_prompt = model.create_voice_clone_prompt(
+                ref_audio=primary_info.path,
+                ref_text=primary_info.transcript,
+                x_vector_only_mode=False,
+            )
+
+        output_audio = None
+        if test_text.strip():
+            if len(test_text) > MAX_CHARS:
+                raise gr.Error(f"Test text too long ({len(test_text)} chars)")
+
+            char_count = len(test_text)
+            auto_max_tokens = estimate_max_tokens(test_text)
+            est_time = max(10, char_count * 0.15)
+            progress(0.4, desc=f"Generating ~{est_time:.0f}s for {char_count} chars...")
+
+            wavs, sr = model.generate_voice_clone(
+                text=test_text,
+                language=language,
+                voice_clone_prompt=voice_clone_prompt,
+                temperature=temperature,
+                top_k=int(top_k),
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                max_new_tokens=auto_max_tokens,
+                subtalker_temperature=sub_temp,
+                subtalker_top_k=int(sub_top_k),
+                subtalker_top_p=sub_top_p,
+            )
+
+            gen_time = time.time() - start_time
+            progress(0.9, desc=f"Saving audio ({gen_time:.1f}s)...")
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                sf.write(f.name, wavs[0], sr)
+                n_samples = len(sample_infos) if combine_samples else 1
+                output_audio = save_to_history(
+                    f.name,
+                    test_text,
+                    f"Clone ({model_name}, {n_samples} samples)",
+                    "clone",
+                    gen_time,
+                    model_name=model_name,
+                    params={
+                        "temperature": temperature,
+                        "top_k": int(top_k),
+                        "top_p": top_p,
+                        "repetition_penalty": repetition_penalty,
+                        "max_new_tokens": auto_max_tokens,
+                        "subtalker_temperature": sub_temp,
+                        "subtalker_top_k": int(sub_top_k),
+                        "subtalker_top_p": sub_top_p,
+                        "language": language,
+                        "num_samples": n_samples,
+                    },
+                )
+            duration = get_audio_duration(output_audio)
+            audio_info = (
+                f" | Duration: {format_duration(duration)} | Tokens: {auto_max_tokens}"
+            )
+        else:
+            gen_time = time.time() - start_time
+            audio_info = ""
+
+        prompt_temp = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+        cpu_prompt = _prompt_to_cpu(voice_clone_prompt)
+        with open(prompt_temp.name, "wb") as f:
+            pickle.dump(cpu_prompt, f)
+
+        samples_meta = [
+            {
+                "path": s.path,
+                "duration": s.duration,
+                "transcript": s.transcript,
+                "snr_estimate": s.snr_estimate,
+                "is_primary": s.is_primary,
+                "weight": s.weight,
+            }
+            for s in sample_infos
+        ]
+        samples_meta_json = json.dumps(samples_meta)
+
+        n_samples = len(sample_infos) if combine_samples else 1
+        total_duration = sum(s.duration for s in sample_infos)
+        progress(1.0, desc="Complete!")
+        status = f"Done in {gen_time:.1f}s{audio_info} | {n_samples} sample(s), {total_duration:.1f}s total ref audio"
+
+        return output_audio, prompt_temp.name, model_name, samples_meta_json, status
+    except Exception as e:
+        traceback.print_exc()
+        raise gr.Error(format_user_error(e))
+    finally:
+        del wavs
+        del voice_clone_prompt
+        _mps_cleanup()
+
+
+def analyze_uploaded_samples(audio_files: list) -> tuple[str, str]:
+    if not audio_files:
+        return "", ""
+
+    audio_paths = []
+    for af in audio_files:
+        if af is None:
+            continue
+        path = af if isinstance(af, str) else af.name
+        audio_paths.append(path)
+
+    if not audio_paths:
+        return "", ""
+
+    sample_infos = analyze_audio_samples(audio_paths)
+    summary = format_samples_summary(sample_infos)
+    warnings = get_sample_warnings(sample_infos)
+    warnings_html = "<br>".join(warnings) if warnings else ""
+
+    return summary, warnings_html
+
+
+def save_cloned_voice_multi(
+    voice_name: str,
+    description: str,
+    style_note: str,
+    audio_files: list,
+    transcripts_json: str,
+    prompt_path: str,
+    model_name: str,
+    samples_meta_json: str,
+):
+    if not voice_name.strip():
+        gr.Warning("Please enter a name for this voice")
+        return "Please enter a name for this voice", gr.update()
+    if not prompt_path or not os.path.exists(prompt_path):
+        gr.Warning("Clone a voice first before saving")
+        return "Clone a voice first before saving", gr.update()
+
+    try:
+        safe_name = "".join(c for c in voice_name if c.isalnum() or c in "_-").strip()
+        if not safe_name or safe_name in (".", ".."):
+            gr.Warning(
+                "Invalid voice name - use only letters, numbers, underscores, hyphens"
+            )
+            return "Invalid voice name", gr.update()
+
+        voice_dir = (SAVED_VOICES_DIR / safe_name).resolve()
+        try:
+            voice_dir.relative_to(SAVED_VOICES_DIR.resolve())
+        except ValueError:
+            gr.Warning("Invalid voice name")
+            return "Invalid voice name", gr.update()
+
+        voice_dir.mkdir(exist_ok=True)
+        shutil.copy(prompt_path, voice_dir / "prompt.pkl")
+
+        try:
+            transcripts = json.loads(transcripts_json) if transcripts_json else {}
+        except json.JSONDecodeError:
+            transcripts = {}
+
+        try:
+            samples_meta = json.loads(samples_meta_json) if samples_meta_json else []
+        except json.JSONDecodeError:
+            samples_meta = []
+
+        ref_audios_dir = voice_dir / "ref_audios"
+        ref_audios_dir.mkdir(exist_ok=True)
+        saved_ref_paths = []
+
+        if audio_files:
+            for i, af in enumerate(audio_files):
+                if af is None:
+                    continue
+                src_path = af if isinstance(af, str) else af.name
+                fname = Path(src_path).name
+                dest_path = ref_audios_dir / f"sample_{i:02d}_{fname}"
+                shutil.copy(src_path, dest_path)
+                saved_ref_paths.append(str(dest_path.relative_to(voice_dir)))
+
+        primary_transcript = ""
+        if samples_meta:
+            primary_sample = next(
+                (s for s in samples_meta if s.get("is_primary")),
+                samples_meta[0] if samples_meta else None,
+            )
+            if primary_sample:
+                primary_transcript = primary_sample.get("transcript", "")
+
+        metadata = {
+            "name": voice_name,
+            "description": description,
+            "style_note": style_note,
+            "ref_text": primary_transcript,
+            "model": model_name or "1.7B-Base",
+            "created": datetime.now().isoformat(),
+            "multi_sample": True,
+            "num_samples": len(saved_ref_paths),
+            "samples": samples_meta,
+            "ref_audio_paths": saved_ref_paths,
+        }
+        with open(voice_dir / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        gr.Info(f"Voice '{voice_name}' saved with {len(saved_ref_paths)} sample(s)!")
+        return f"Saved voice: {safe_name}", gr.update(choices=get_saved_voice_choices())
+    except Exception as e:
+        error_msg = format_user_error(e)
+        gr.Warning(f"Failed to save voice: {error_msg}")
+        return f"Error: {error_msg}", gr.update()
 
 
 def save_cloned_voice(
@@ -2770,25 +3191,70 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             cv_history_delete_confirm = gr.State(False)
 
                 with gr.TabItem("Clone Voice", id="clone"):
+                    gr.HTML(f"<style>{MULTISAMPLE_CSS}</style>")
+
                     with gr.Row():
                         with gr.Column(scale=1):
-                            gr.HTML('<div class="section-header">Reference Audio</div>')
+                            gr.HTML(
+                                '<div class="section-header">Reference Samples</div>'
+                            )
+                            gr.Markdown(
+                                "*Upload multiple voice samples for better quality. "
+                                "More samples = more consistent voice cloning.*",
+                                elem_classes=["info-text"],
+                            )
 
-                            vc_ref_audio = gr.Audio(
-                                label="Upload Reference Audio",
+                            vc_ref_audio = gr.File(
+                                label="Upload Audio Samples",
+                                file_count="multiple",
+                                file_types=["audio"],
                                 type="filepath",
-                                sources=["upload", "microphone"],
                             )
-                            vc_ref_text = gr.Textbox(
-                                label="Reference Transcript",
-                                placeholder="Enter the exact words spoken in the reference audio...",
-                                lines=3,
-                                info="Must match the reference audio exactly",
+
+                            vc_samples_summary = gr.Textbox(
+                                label="Sample Analysis",
+                                interactive=False,
+                                lines=5,
+                                placeholder="Upload samples to see analysis...",
                             )
-                            with gr.Row():
-                                vc_auto_transcribe_btn = gr.Button(
-                                    "Auto-transcribe", size="sm"
+                            vc_samples_warnings = gr.HTML(value="")
+
+                            vc_combine_samples = gr.Checkbox(
+                                label="Combine samples for better quality",
+                                value=True,
+                                info="Merges voice characteristics from all samples",
+                            )
+
+                            gr.HTML(
+                                '<div class="section-header" style="margin-top:1rem;">Transcripts</div>'
+                            )
+
+                            with gr.Accordion("Sample Transcripts", open=True):
+                                gr.Markdown(
+                                    "*Enter transcript for each sample. Primary sample's transcript is required.*"
                                 )
+                                vc_transcript_1 = gr.Textbox(
+                                    label="Sample 1 (Primary)",
+                                    placeholder="Enter the exact words spoken...",
+                                    lines=2,
+                                )
+                                vc_transcript_2 = gr.Textbox(
+                                    label="Sample 2",
+                                    placeholder="Optional: transcript for sample 2...",
+                                    lines=2,
+                                )
+                                vc_transcript_3 = gr.Textbox(
+                                    label="Sample 3",
+                                    placeholder="Optional: transcript for sample 3...",
+                                    lines=2,
+                                )
+                                with gr.Row():
+                                    vc_auto_transcribe_btn = gr.Button(
+                                        "Auto-transcribe Primary", size="sm"
+                                    )
+
+                            vc_transcripts_json = gr.State(value="{}")
+
                             vc_model = gr.Radio(
                                 ["1.7B-Base", "0.6B-Base"],
                                 value="1.7B-Base",
@@ -2847,6 +3313,8 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
                             vc_save_status = gr.Textbox(
                                 label="", interactive=False, show_label=False
                             )
+
+                    vc_samples_meta_json = gr.State(value="")
 
                 with gr.TabItem("Saved Voices", id="saved"):
                     with gr.Row():
@@ -4918,31 +5386,80 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
         show_progress="hidden",
     )
 
+    def build_transcripts_json(files, t1, t2, t3):
+        transcripts = {}
+        if files:
+            for i, f in enumerate(files[:3]):
+                if f is None:
+                    continue
+                fname = Path(f).name if isinstance(f, str) else Path(f.name).name
+                transcript = [t1, t2, t3][i] if i < 3 else ""
+                if transcript and transcript.strip():
+                    transcripts[fname] = transcript.strip()
+        return json.dumps(transcripts)
+
+    def auto_transcribe_first_sample(files):
+        if not files:
+            return ""
+        first_file = files[0] if isinstance(files, list) else files
+        if first_file is None:
+            return ""
+        path = first_file if isinstance(first_file, str) else first_file.name
+        return auto_transcribe_audio(path)
+
+    vc_ref_audio.change(
+        fn=analyze_uploaded_samples,
+        inputs=[vc_ref_audio],
+        outputs=[vc_samples_summary, vc_samples_warnings],
+    )
+
     vc_clone_btn.click(
-        fn=clone_voice,
-        inputs=[vc_ref_audio, vc_ref_text, vc_model, vc_test_text, vc_language]
+        fn=lambda files, t1, t2, t3: build_transcripts_json(files, t1, t2, t3),
+        inputs=[vc_ref_audio, vc_transcript_1, vc_transcript_2, vc_transcript_3],
+        outputs=[vc_transcripts_json],
+    ).then(
+        fn=clone_voice_multi,
+        inputs=[
+            vc_ref_audio,
+            vc_transcripts_json,
+            vc_model,
+            vc_test_text,
+            vc_language,
+            vc_combine_samples,
+        ]
         + all_param_sliders,
-        outputs=[vc_output, current_prompt_data, current_clone_model, vc_status],
+        outputs=[
+            vc_output,
+            current_prompt_data,
+            current_clone_model,
+            vc_samples_meta_json,
+            vc_status,
+        ],
         concurrency_limit=1,
         concurrency_id="generation",
     )
 
     vc_auto_transcribe_btn.click(
-        fn=auto_transcribe_audio,
+        fn=auto_transcribe_first_sample,
         inputs=[vc_ref_audio],
-        outputs=[vc_ref_text],
+        outputs=[vc_transcript_1],
     )
 
     vc_save_btn.click(
-        fn=save_cloned_voice,
+        fn=lambda files, t1, t2, t3: build_transcripts_json(files, t1, t2, t3),
+        inputs=[vc_ref_audio, vc_transcript_1, vc_transcript_2, vc_transcript_3],
+        outputs=[vc_transcripts_json],
+    ).then(
+        fn=save_cloned_voice_multi,
         inputs=[
             vc_name,
             vc_description,
             vc_style_note,
             vc_ref_audio,
-            vc_ref_text,
+            vc_transcripts_json,
             current_prompt_data,
             current_clone_model,
+            vc_samples_meta_json,
         ],
         outputs=[vc_save_status, sv_voice_dropdown],
     ).then(
