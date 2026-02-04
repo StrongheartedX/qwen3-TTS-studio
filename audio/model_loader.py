@@ -14,6 +14,7 @@ MODEL_PATHS = {
     "0.6B-CustomVoice": "./Qwen3-TTS-12Hz-0.6B-CustomVoice",
     "1.7B-Base": "./Qwen3-TTS-12Hz-1.7B-Base",
     "0.6B-Base": "./Qwen3-TTS-12Hz-0.6B-Base",
+    "1.7B-VoiceDesign": "./Qwen3-TTS-12Hz-1.7B-VoiceDesign",
 }
 
 MAX_MODELS_ON_MPS = 1

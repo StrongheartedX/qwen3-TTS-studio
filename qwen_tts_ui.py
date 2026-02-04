@@ -1251,6 +1251,141 @@ def generate_custom_voice(
         _mps_cleanup()
 
 
+def generate_voice_design(
+    text,
+    voice_description,
+    language,
+    temperature,
+    top_k,
+    top_p,
+    repetition_penalty,
+    max_new_tokens,
+    sub_temp,
+    sub_top_k,
+    sub_top_p,
+    progress=gr.Progress(),
+):
+    if not text.strip():
+        raise gr.Error("Please enter text to generate")
+
+    if not voice_description.strip():
+        raise gr.Error("Please enter a voice description")
+
+    MAX_VOICE_DESC_LENGTH = 500
+    if len(voice_description) > MAX_VOICE_DESC_LENGTH:
+        raise gr.Error(
+            f"Voice description too long ({len(voice_description)} chars). Maximum is {MAX_VOICE_DESC_LENGTH}."
+        )
+
+    if len(text) > MAX_CHARS:
+        raise gr.Error(f"Text too long ({len(text)} chars). Maximum is {MAX_CHARS}.")
+
+    save_settings(
+        {
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "max_new_tokens": max_new_tokens,
+            "subtalker_temperature": sub_temp,
+            "subtalker_top_k": sub_top_k,
+            "subtalker_top_p": sub_top_p,
+        }
+    )
+
+    start_time = time.time()
+    char_count = len(text)
+    auto_max_tokens = estimate_max_tokens(text)
+    est_time = max(10, char_count * 0.15)
+
+    wavs = None
+    try:
+        progress(0.1, desc="Loading VoiceDesign model...")
+        model = get_model("1.7B-VoiceDesign")
+
+        if not hasattr(model, "generate_voice_design"):
+            raise gr.Error(
+                "VoiceDesign model doesn't support generate_voice_design(). "
+                "Please ensure you have the correct model downloaded."
+            )
+
+        load_time = time.time() - start_time
+
+        progress(
+            0.2,
+            desc=f"Model loaded ({load_time:.1f}s). Generating ~{est_time:.0f}s for {char_count} chars...",
+        )
+
+        actual_language = language if language and language != "auto" else None
+
+        gen_kwargs = {
+            "text": text,
+            "instruct": voice_description.strip(),
+            "temperature": temperature,
+            "top_k": int(top_k),
+            "top_p": top_p,
+            "repetition_penalty": repetition_penalty,
+            "max_new_tokens": auto_max_tokens,
+            "subtalker_temperature": sub_temp,
+            "subtalker_top_k": int(sub_top_k),
+            "subtalker_top_p": sub_top_p,
+        }
+        if actual_language:
+            gen_kwargs["language"] = actual_language
+
+        wavs, sr = model.generate_voice_design(**gen_kwargs)
+
+        # Guard against empty result
+        if wavs is None or len(wavs) == 0:
+            raise gr.Error(
+                "Model returned empty audio. Try different parameters or voice description."
+            )
+
+        gen_time = time.time() - start_time
+
+        progress(0.9, desc=f"Saving audio ({gen_time:.1f}s)...")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_path = f.name
+            sf.write(temp_path, wavs[0], sr)
+
+        try:
+            history_path = save_to_history(
+                temp_path,
+                text,
+                f"VoiceDesign",
+                "design",
+                gen_time,
+                model_name="1.7B-VoiceDesign",
+                params={
+                    "temperature": temperature,
+                    "top_k": int(top_k),
+                    "top_p": top_p,
+                    "repetition_penalty": repetition_penalty,
+                    "max_new_tokens": auto_max_tokens,
+                    "subtalker_temperature": sub_temp,
+                    "subtalker_top_k": int(sub_top_k),
+                    "subtalker_top_p": sub_top_p,
+                    "language": actual_language,
+                    "voice_description": voice_description.strip(),
+                },
+            )
+
+            duration = get_audio_duration(history_path)
+            status = f"Done in {gen_time:.1f}s | Duration: {format_duration(duration)} | Tokens: {auto_max_tokens}"
+
+            progress(1.0, desc="Complete!")
+            return history_path, status
+        finally:
+            # Clean up temp file to prevent leak
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    except Exception as e:
+        raise gr.Error(format_user_error(e))
+    finally:
+        del wavs
+        _mps_cleanup()
+
+
 def clone_voice(
     ref_audio,
     ref_text,
@@ -3428,6 +3563,129 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
 
                     vc_samples_meta_json = gr.State(value="")
 
+                with gr.TabItem("Voice Design", id="design"):
+                    with gr.Row():
+                        with gr.Column(scale=1):
+                            gr.HTML(
+                                '<div class="section-header">Voice Description</div>'
+                            )
+                            gr.Markdown(
+                                "*Describe the voice you want in natural language. "
+                                "Include age, gender, tone, emotion, accent, etc.*"
+                            )
+
+                            vd_description = gr.Textbox(
+                                label="Voice Description",
+                                placeholder="A warm female voice with a British accent, speaking softly and calmly...",
+                                lines=4,
+                                info="Describe the desired voice characteristics",
+                            )
+
+                            vd_language = gr.Dropdown(
+                                choices=LANGUAGES,
+                                value="auto",
+                                label="Language",
+                                info="Auto-detect or specify language",
+                            )
+
+                            gr.HTML(
+                                '<div class="section-header" style="margin-top:1rem;">Example Descriptions</div>'
+                            )
+                            gr.Markdown(
+                                """
+**English Examples:**
+- "A cheerful young female voice with high pitch and energetic tone"
+- "Deep male voice, mature, authoritative, speaking slowly and clearly"
+- "Elderly woman, warm and gentle, with a slight tremor in voice"
+
+**한국어 예시:**
+- "밝고 활기찬 20대 여성 목소리, 높은 톤"
+- "차분하고 신뢰감 있는 중년 남성 목소리"
+                                """,
+                                elem_classes=["info-text"],
+                            )
+
+                        with gr.Column(scale=2):
+                            gr.HTML('<div class="section-header">Text Input</div>')
+
+                            vd_text = gr.Textbox(
+                                label="Text to Speak",
+                                placeholder="Enter the text you want to convert to speech...",
+                                lines=4,
+                                max_lines=8,
+                            )
+                            vd_char_count = gr.HTML(value=update_char_count(""))
+
+                            vd_btn = gr.Button(
+                                "Generate Speech",
+                                variant="primary",
+                                elem_classes=["generate-btn"],
+                                size="lg",
+                            )
+
+                            vd_status = gr.Textbox(
+                                label="Status", interactive=False, show_label=True
+                            )
+
+                            vd_audio = gr.Audio(
+                                label="Generated Audio", type="filepath"
+                            )
+                            vd_download = gr.File(label="Download Audio", visible=False)
+
+                            gr.HTML(
+                                '<div class="history-section"><div class="history-header">Recent History</div></div>'
+                            )
+                            with gr.Row():
+                                vd_history_search = gr.Textbox(
+                                    placeholder="Search history...",
+                                    show_label=False,
+                                    scale=3,
+                                )
+                                vd_history_favorites = gr.Checkbox(
+                                    label="Favorites only",
+                                    value=False,
+                                    scale=1,
+                                )
+                            vd_history_display = gr.HTML(
+                                value=format_history_for_display(),
+                                elem_classes=["history-display"],
+                            )
+                            vd_init = get_history_initial()
+                            vd_history_dropdown = gr.Dropdown(
+                                choices=vd_init[0],
+                                value=vd_init[1],
+                                label="Select to play",
+                                allow_custom_value=False,
+                            )
+                            vd_history_text = gr.Textbox(
+                                label="Text",
+                                lines=2,
+                                interactive=False,
+                                value=vd_init[3],
+                            )
+                            vd_history_params = gr.Textbox(
+                                label="Generation Settings",
+                                lines=1,
+                                interactive=False,
+                                value=vd_init[4],
+                            )
+                            vd_history_audio = gr.Audio(
+                                label="Playback",
+                                type="filepath",
+                                interactive=False,
+                                value=vd_init[2],
+                            )
+                            with gr.Row(elem_classes=["mini-btn-row"]):
+                                vd_history_refresh = gr.Button("Refresh", size="sm")
+                                vd_history_apply = gr.Button(
+                                    "Apply Settings", size="sm"
+                                )
+                                vd_history_favorite = gr.Button("★ Favorite", size="sm")
+                                vd_history_delete = gr.Button(
+                                    "Delete", size="sm", variant="stop"
+                                )
+                            vd_history_delete_confirm = gr.State(False)
+
                 with gr.TabItem("Saved Voices", id="saved"):
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -5496,6 +5754,79 @@ with gr.Blocks(title="Qwen3-TTS Studio") as demo:
         fn=lambda: gr.update(choices=get_history_choices()),
         outputs=[cv_history_dropdown],
         show_progress="hidden",
+    )
+
+    vd_text.change(fn=update_char_count, inputs=[vd_text], outputs=[vd_char_count])
+
+    vd_btn.click(
+        fn=generate_voice_design,
+        inputs=[vd_text, vd_description, vd_language] + all_param_sliders,
+        outputs=[vd_audio, vd_status],
+        concurrency_limit=1,
+        concurrency_id="generation",
+    ).then(
+        fn=lambda: gr.update(choices=get_history_choices()),
+        outputs=[vd_history_dropdown],
+        show_progress="hidden",
+    )
+
+    vd_history_dropdown.change(
+        fn=play_history_item_with_details,
+        inputs=[vd_history_dropdown],
+        outputs=[vd_history_audio, vd_history_text, vd_history_params],
+        concurrency_id="history",
+        concurrency_limit=None,
+        show_progress="hidden",
+    ).then(
+        fn=lambda: False,
+        outputs=[vd_history_delete_confirm],
+    )
+    vd_history_refresh.click(
+        fn=lambda: gr.update(choices=get_history_choices()),
+        outputs=[vd_history_dropdown],
+        concurrency_id="history",
+        concurrency_limit=None,
+        show_progress="hidden",
+    )
+    vd_history_apply.click(
+        fn=apply_history_params,
+        inputs=[vd_history_dropdown],
+        outputs=all_param_sliders + [save_indicator],
+        concurrency_id="history",
+        concurrency_limit=None,
+    )
+    vd_history_delete.click(
+        fn=delete_history_item,
+        inputs=[vd_history_dropdown, vd_history_delete_confirm],
+        outputs=[
+            vd_status,
+            vd_history_dropdown,
+            vd_history_audio,
+            vd_history_delete_confirm,
+        ],
+        concurrency_id="history",
+        concurrency_limit=None,
+    )
+    vd_history_favorite.click(
+        fn=toggle_favorite,
+        inputs=[vd_history_dropdown],
+        outputs=[vd_status, vd_history_display, vd_history_dropdown],
+        concurrency_id="history",
+        concurrency_limit=None,
+    )
+    vd_history_search.change(
+        fn=search_history,
+        inputs=[vd_history_search, vd_history_favorites],
+        outputs=[vd_history_display],
+        concurrency_id="history",
+        concurrency_limit=None,
+    )
+    vd_history_favorites.change(
+        fn=search_history,
+        inputs=[vd_history_search, vd_history_favorites],
+        outputs=[vd_history_display],
+        concurrency_id="history",
+        concurrency_limit=None,
     )
 
     def build_transcripts_json(files, t1, t2, t3):
